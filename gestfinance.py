@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import sqlite3
+import psycopg2
 
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -10,49 +10,48 @@ import sqlite3
 st.set_page_config(page_title="Cashflow Web", page_icon="💰", layout="wide")
 
 # ==========================================
-# 1. FUNÇÕES DE BASE DE DADOS E POP-UPS
+# 1. FUNÇÕES DE BASE DE DADOS (POSTGRESQL)
 # ==========================================
+def get_db_connection():
+    return psycopg2.connect(st.secrets["DATABASE_URL"])
+
 def init_db():
-    conn = sqlite3.connect('cashflow.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT, password TEXT)''')
     
-    # Tabela principal atualizada com forma de pagamento
     c.execute('''CREATE TABLE IF NOT EXISTS transacoes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, estabelecimento TEXT, 
+                    id SERIAL PRIMARY KEY, data TEXT, estabelecimento TEXT, 
                     descricao TEXT, tipo_pgto TEXT, valor_total REAL, qtd_parc INTEGER, 
                     valor_parcela REAL, forma_pgto TEXT, cartao TEXT, categoria TEXT, devedor TEXT)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS receitas (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, origem TEXT, 
+                    id SERIAL PRIMARY KEY, data TEXT, origem TEXT, 
                     conta TEXT, recebimento TEXT, valor REAL)''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS contas_fixas (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, dia INTEGER, valor REAL, descricao TEXT,
+                    id SERIAL PRIMARY KEY, dia INTEGER, valor REAL, descricao TEXT,
                     estabelecimento TEXT, forma_pgto TEXT, cartao TEXT, categoria TEXT, devedor TEXT)''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS cartoes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, 
+                    id SERIAL PRIMARY KEY, nome TEXT, 
                     dia_fechamento INTEGER, dia_vencimento INTEGER, bandeira TEXT)''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS categorias (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, cor TEXT)''')
+                    id SERIAL PRIMARY KEY, nome TEXT, cor TEXT)''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS devedores (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT)''')
+                    id SERIAL PRIMARY KEY, nome TEXT)''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS estabelecimentos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, razao_social TEXT, tipo TEXT)''')
+                    id SERIAL PRIMARY KEY, nome TEXT, razao_social TEXT, tipo TEXT)''')
                     
     try:
-        c.execute('''ALTER TABLE transacoes ADD COLUMN id_conta_fixa TEXT''')
+        c.execute('''ALTER TABLE transacoes ADD COLUMN IF NOT EXISTS id_conta_fixa TEXT''')
+        c.execute('''ALTER TABLE contas_fixas ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Ativa' ''')
+        c.execute('''ALTER TABLE contas_fixas ADD COLUMN IF NOT EXISTS id_referencia TEXT''')
     except:
-        pass
-    try:
-        c.execute('''ALTER TABLE contas_fixas ADD COLUMN status TEXT DEFAULT 'Ativa' ''')
-        c.execute('''ALTER TABLE contas_fixas ADD COLUMN id_referencia TEXT''')
-    except:
-        pass
+        conn.rollback()
     
     c.execute("SELECT * FROM users WHERE username='robert'")
     if not c.fetchone():
@@ -60,52 +59,67 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Função segura para substituir o pd.read_sql_query com o psycopg2
+def carregar_dados(query, params=None):
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute(query, params or ())
+        cols = [desc[0] for desc in c.description]
+        df = pd.DataFrame(c.fetchall(), columns=cols)
+    except Exception as e:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    return df
+
 def atualizar_bd_tabela(nome_tabela, df_editado):
-    conn = sqlite3.connect('cashflow.db')
+    conn = get_db_connection()
     c = conn.cursor()
     cols_db = [col for col in df_editado.columns if col not in ['✔', 'PREVISÃO', 'Excluir']]
     
     ids_ativos = df_editado[df_editado['id'].notna()]['id'].tolist()
     if ids_ativos:
-        placeholders = ','.join('?' for _ in ids_ativos)
-        c.execute(f"DELETE FROM {nome_tabela} WHERE id NOT IN ({placeholders})", ids_ativos)
+        placeholders = ','.join('%s' for _ in ids_ativos)
+        c.execute(f"DELETE FROM {nome_tabela} WHERE id NOT IN ({placeholders})", tuple(ids_ativos))
     else:
         c.execute(f"DELETE FROM {nome_tabela}")
         
     colunas_update = [col for col in cols_db if col != 'id']
-    set_clause = ', '.join([f"{col}=?" for col in colunas_update])
+    set_clause = ', '.join([f"{col}=%s" for col in colunas_update])
     cols_insert = ', '.join(colunas_update)
-    vals_insert = ', '.join(['?' for _ in colunas_update])
+    vals_insert = ', '.join(['%s' for _ in colunas_update])
     
     for _, row in df_editado.iterrows():
         valores = [None if pd.isna(row[col]) else row[col] for col in colunas_update]
         if pd.notna(row['id']):
-            c.execute(f"UPDATE {nome_tabela} SET {set_clause} WHERE id=?", valores + [row['id']])
+            c.execute(f"UPDATE {nome_tabela} SET {set_clause} WHERE id=%s", tuple(valores + [row['id']]))
         else:
-            c.execute(f"INSERT INTO {nome_tabela} ({cols_insert}) VALUES ({vals_insert})", valores)
+            c.execute(f"INSERT INTO {nome_tabela} ({cols_insert}) VALUES ({vals_insert})", tuple(valores))
     conn.commit()
     conn.close()
 
 def excluir_registos(nome_tabela, df_editado):
     ids_para_excluir = df_editado[df_editado['Excluir'] == True]['id'].tolist()
     if ids_para_excluir:
-        conn = sqlite3.connect('cashflow.db')
+        conn = get_db_connection()
         c = conn.cursor()
-        placeholders = ','.join('?' for _ in ids_para_excluir)
-        c.execute(f"DELETE FROM {nome_tabela} WHERE id IN ({placeholders})", ids_para_excluir)
+        placeholders = ','.join('%s' for _ in ids_para_excluir)
+        c.execute(f"DELETE FROM {nome_tabela} WHERE id IN ({placeholders})", tuple(ids_para_excluir))
         conn.commit()
         conn.close()
         return True
     return False
 
 def carregar_lista(tabela, coluna):
-    conn = sqlite3.connect('cashflow.db')
     try:
-        df = pd.read_sql_query(f"SELECT {coluna} FROM {tabela} ORDER BY {coluna} ASC", conn)
-        lista = [""] + df[coluna].tolist()
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute(f"SELECT {coluna} FROM {tabela} ORDER BY {coluna} ASC")
+        lista = [""] + [row[0] for row in c.fetchall()]
+        conn.close()
     except:
         lista = [""]
-    conn.close()
     return lista
 
 # --- JANELAS POP-UP (MODAIS) ---
@@ -115,8 +129,9 @@ def modal_estabelecimento():
     tipo = st.radio("Tipo:", ["Físico", "Online"], horizontal=True)
     if st.button("Salvar", type="primary"):
         if nome:
-            conn = sqlite3.connect('cashflow.db')
-            conn.execute('INSERT INTO estabelecimentos (nome, razao_social, tipo) VALUES (?, ?, ?)', (nome.upper(), "", tipo))
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('INSERT INTO estabelecimentos (nome, razao_social, tipo) VALUES (%s, %s, %s)', (nome.upper(), "", tipo))
             conn.commit()
             conn.close()
             st.rerun()
@@ -127,8 +142,9 @@ def modal_cartao():
     bandeira = st.radio("Bandeira:", ["MasterCard", "Visa"], horizontal=True)
     if st.button("Salvar", type="primary"):
         if nome:
-            conn = sqlite3.connect('cashflow.db')
-            conn.execute('INSERT INTO cartoes (nome, dia_fechamento, dia_vencimento, bandeira) VALUES (?, ?, ?, ?)', (nome.upper(), 1, 10, bandeira))
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('INSERT INTO cartoes (nome, dia_fechamento, dia_vencimento, bandeira) VALUES (%s, %s, %s, %s)', (nome.upper(), 1, 10, bandeira))
             conn.commit()
             conn.close()
             st.rerun()
@@ -139,8 +155,9 @@ def modal_categoria():
     cor = st.color_picker("Cor:", value="#00C49F")
     if st.button("Salvar", type="primary"):
         if nome:
-            conn = sqlite3.connect('cashflow.db')
-            conn.execute('INSERT INTO categorias (nome, cor) VALUES (?, ?)', (nome.upper(), cor))
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('INSERT INTO categorias (nome, cor) VALUES (%s, %s)', (nome.upper(), cor))
             conn.commit()
             conn.close()
             st.rerun()
@@ -150,8 +167,9 @@ def modal_devedor():
     nome = st.text_input("Nome do Devedor:")
     if st.button("Salvar", type="primary"):
         if nome:
-            conn = sqlite3.connect('cashflow.db')
-            conn.execute('INSERT INTO devedores (nome) VALUES (?)', (nome.upper(),))
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('INSERT INTO devedores (nome) VALUES (%s)', (nome.upper(),))
             conn.commit()
             conn.close()
             st.rerun()
@@ -171,9 +189,9 @@ def modal_calculadora():
 # 2. SISTEMA DE LOGIN
 # ==========================================
 def check_login(username, password):
-    conn = sqlite3.connect('cashflow.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
+    c.execute("SELECT * FROM users WHERE username=%s AND password=%s", (username, password))
     user = c.fetchone()
     conn.close()
     return user is not None
@@ -284,36 +302,36 @@ if menu_selecionado == "Dashboard":
     
     if ano_sel and mes_sel:
         mes_num = meses_nomes.index(mes_sel)
-        condicoes.append("data LIKE ?")
+        condicoes.append("data LIKE %s")
         params_sql.append(f"%/{mes_num:02d}/{ano_sel}")
-        condicoes_rec.append("data LIKE ?")
+        condicoes_rec.append("data LIKE %s")
         params_sql_rec.append(f"%/{mes_num:02d}/{ano_sel}")
     elif ano_sel:
-        condicoes.append("data LIKE ?")
+        condicoes.append("data LIKE %s")
         params_sql.append(f"%/%/{ano_sel}")
-        condicoes_rec.append("data LIKE ?")
+        condicoes_rec.append("data LIKE %s")
         params_sql_rec.append(f"%/%/{ano_sel}")
     elif mes_sel:
         mes_num = meses_nomes.index(mes_sel)
-        condicoes.append("data LIKE ?")
+        condicoes.append("data LIKE %s")
         params_sql.append(f"%/{mes_num:02d}/%")
-        condicoes_rec.append("data LIKE ?")
+        condicoes_rec.append("data LIKE %s")
         params_sql_rec.append(f"%/{mes_num:02d}/%")
 
     if f_cartoes:
-        places = ','.join('?' for _ in f_cartoes)
+        places = ','.join('%s' for _ in f_cartoes)
         condicoes.append(f"cartao IN ({places})")
         params_sql.extend(f_cartoes)
     if f_estab:
-        places = ','.join('?' for _ in f_estab)
+        places = ','.join('%s' for _ in f_estab)
         condicoes.append(f"estabelecimento IN ({places})")
         params_sql.extend(f_estab)
     if f_cat:
-        places = ','.join('?' for _ in f_cat)
+        places = ','.join('%s' for _ in f_cat)
         condicoes.append(f"categoria IN ({places})")
         params_sql.extend(f_cat)
     if f_dev:
-        places = ','.join('?' for _ in f_dev)
+        places = ','.join('%s' for _ in f_dev)
         condicoes.append(f"devedor IN ({places})")
         params_sql.extend(f_dev)
 
@@ -323,9 +341,6 @@ if menu_selecionado == "Dashboard":
     filtro_sql_rec = " WHERE " + " AND ".join(condicoes_rec) if condicoes_rec else ""
     params_sql_rec = tuple(params_sql_rec)
 
-    # Leitura Real da Base de Dados para o Dashboard
-    conn = sqlite3.connect('cashflow.db')
-    
     saldo_anterior = 0.0
     if ano_sel:
         if mes_sel:
@@ -334,17 +349,18 @@ if menu_selecionado == "Dashboard":
         else:
             limite_ym = f"{ano_sel}01"
             
-        c_rec = pd.read_sql_query(f"SELECT SUM(valor) as total FROM receitas WHERE substr(data,7,4) || substr(data,4,2) < '{limite_ym}'", conn)
-        c_desp = pd.read_sql_query(f"SELECT SUM(valor_parcela) as total FROM transacoes WHERE substr(data,7,4) || substr(data,4,2) < '{limite_ym}'", conn)
-        prev_rec = c_rec['total'][0] if pd.notna(c_rec['total'][0]) else 0.0
-        prev_desp = c_desp['total'][0] if pd.notna(c_desp['total'][0]) else 0.0
+        c_rec = carregar_dados(f"SELECT SUM(valor) as total FROM receitas WHERE substr(data,7,4) || substr(data,4,2) < '{limite_ym}'")
+        c_desp = carregar_dados(f"SELECT SUM(valor_parcela) as total FROM transacoes WHERE substr(data,7,4) || substr(data,4,2) < '{limite_ym}'")
+        
+        prev_rec = float(c_rec['total'].iloc[0]) if not c_rec.empty and pd.notna(c_rec['total'].iloc[0]) else 0.0
+        prev_desp = float(c_desp['total'].iloc[0]) if not c_desp.empty and pd.notna(c_desp['total'].iloc[0]) else 0.0
         saldo_anterior = prev_rec - prev_desp
 
-    df_rec = pd.read_sql_query(f"SELECT SUM(valor) as total FROM receitas{filtro_sql_rec}", conn, params=params_sql_rec)
-    df_desp = pd.read_sql_query(f"SELECT SUM(valor_parcela) as total FROM transacoes{filtro_sql}", conn, params=params_sql)
+    df_rec = carregar_dados(f"SELECT SUM(valor) as total FROM receitas{filtro_sql_rec}", params=params_sql_rec)
+    df_desp = carregar_dados(f"SELECT SUM(valor_parcela) as total FROM transacoes{filtro_sql}", params=params_sql)
     
-    total_rec = df_rec['total'][0] if pd.notna(df_rec['total'][0]) else 0.0
-    total_desp = df_desp['total'][0] if pd.notna(df_desp['total'][0]) else 0.0
+    total_rec = float(df_rec['total'].iloc[0]) if not df_rec.empty and pd.notna(df_rec['total'].iloc[0]) else 0.0
+    total_desp = float(df_desp['total'].iloc[0]) if not df_desp.empty and pd.notna(df_desp['total'].iloc[0]) else 0.0
     
     help_rec = None
     help_desp = None
@@ -357,20 +373,18 @@ if menu_selecionado == "Dashboard":
         
     saldo = total_rec - total_desp
     
-    df_cartao = pd.read_sql_query(f"SELECT cartao as Cartão, SUM(valor_parcela) as Valor FROM transacoes{filtro_sql} GROUP BY cartao", conn, params=params_sql)
-    df_estab = pd.read_sql_query(f"SELECT estabelecimento as Estabelecimento, SUM(valor_parcela) as Valor FROM transacoes{filtro_sql} GROUP BY estabelecimento", conn, params=params_sql)
-    df_cat = pd.read_sql_query(f"SELECT categoria as Categoria, SUM(valor_parcela) as Valor FROM transacoes{filtro_sql} GROUP BY categoria", conn, params=params_sql)
-    df_dev = pd.read_sql_query(f"SELECT devedor as Pessoa, SUM(valor_parcela) as Valor FROM transacoes{filtro_sql} GROUP BY devedor", conn, params=params_sql)
+    df_cartao = carregar_dados(f"SELECT cartao as \"Cartão\", SUM(valor_parcela) as \"Valor\" FROM transacoes{filtro_sql} GROUP BY cartao", params=params_sql)
+    df_estab = carregar_dados(f"SELECT estabelecimento as \"Estabelecimento\", SUM(valor_parcela) as \"Valor\" FROM transacoes{filtro_sql} GROUP BY estabelecimento", params=params_sql)
+    df_cat = carregar_dados(f"SELECT categoria as \"Categoria\", SUM(valor_parcela) as \"Valor\" FROM transacoes{filtro_sql} GROUP BY categoria", params=params_sql)
+    df_dev = carregar_dados(f"SELECT devedor as \"Pessoa\", SUM(valor_parcela) as \"Valor\" FROM transacoes{filtro_sql} GROUP BY devedor", params=params_sql)
     
-    df_rec_m = pd.read_sql_query(f"SELECT substr(data,4,2) as Mes, SUM(valor) as Valor, 'Receita' as Tipo FROM receitas{filtro_sql_rec} GROUP BY Mes", conn, params=params_sql_rec)
-    df_desp_m = pd.read_sql_query(f"SELECT substr(data,4,2) as Mes, SUM(valor_parcela) as Valor, 'Despesa' as Tipo FROM transacoes{filtro_sql} GROUP BY Mes", conn, params=params_sql)
+    df_rec_m = carregar_dados(f"SELECT substr(data,4,2) as \"Mes\", SUM(valor) as \"Valor\", 'Receita' as \"Tipo\" FROM receitas{filtro_sql_rec} GROUP BY substr(data,4,2)", params=params_sql_rec)
+    df_desp_m = carregar_dados(f"SELECT substr(data,4,2) as \"Mes\", SUM(valor_parcela) as \"Valor\", 'Despesa' as \"Tipo\" FROM transacoes{filtro_sql} GROUP BY substr(data,4,2)", params=params_sql)
     df_mensal = pd.concat([df_rec_m, df_desp_m]) if not df_rec_m.empty or not df_desp_m.empty else pd.DataFrame()
     
-    df_rec_a = pd.read_sql_query(f"SELECT substr(data,7,4) as Ano, SUM(valor) as Valor, 'Receita' as Tipo FROM receitas{filtro_sql_rec} GROUP BY Ano", conn, params=params_sql_rec)
-    df_desp_a = pd.read_sql_query(f"SELECT substr(data,7,4) as Ano, SUM(valor_parcela) as Valor, 'Despesa' as Tipo FROM transacoes{filtro_sql} GROUP BY Ano", conn, params=params_sql)
+    df_rec_a = carregar_dados(f"SELECT substr(data,7,4) as \"Ano\", SUM(valor) as \"Valor\", 'Receita' as \"Tipo\" FROM receitas{filtro_sql_rec} GROUP BY substr(data,7,4)", params=params_sql_rec)
+    df_desp_a = carregar_dados(f"SELECT substr(data,7,4) as \"Ano\", SUM(valor_parcela) as \"Valor\", 'Despesa' as \"Tipo\" FROM transacoes{filtro_sql} GROUP BY substr(data,7,4)", params=params_sql)
     df_anual = pd.concat([df_rec_a, df_desp_a]) if not df_rec_a.empty or not df_desp_a.empty else pd.DataFrame()
-    
-    conn.close()
 
     st.markdown("<br>", unsafe_allow_html=True)
     
@@ -421,34 +435,31 @@ if menu_selecionado == "Dashboard":
 
     col_g1, col_g2, col_g3, col_g4 = st.columns(4)
     with col_g1:
-        if not df_cartao.empty:
-            fig_cartao = px.bar(df_cartao.sort_values('Valor', ascending=True), x='Valor', y='Cartão', orientation='h', title="CARTÕES", text_auto='.2f', color_discrete_sequence=['#42D6D6'])
+        if not df_cartao.empty and df_cartao['Cartão'].notna().any():
+            fig_cartao = px.bar(df_cartao.dropna(subset=['Cartão']).sort_values('Valor', ascending=True), x='Valor', y='Cartão', orientation='h', title="CARTÕES", text_auto='.2f', color_discrete_sequence=['#42D6D6'])
             st.plotly_chart(apply_chart_style(fig_cartao), use_container_width=True)
     with col_g2:
-        if not df_estab.empty:
-            fig_estab = px.bar(df_estab.sort_values('Valor', ascending=True), x='Valor', y='Estabelecimento', orientation='h', title="ESTABELECIMENTOS", text_auto='.2f', color_discrete_sequence=['#42D6D6'])
+        if not df_estab.empty and df_estab['Estabelecimento'].notna().any():
+            fig_estab = px.bar(df_estab.dropna(subset=['Estabelecimento']).sort_values('Valor', ascending=True), x='Valor', y='Estabelecimento', orientation='h', title="ESTABELECIMENTOS", text_auto='.2f', color_discrete_sequence=['#42D6D6'])
             st.plotly_chart(apply_chart_style(fig_estab), use_container_width=True)
     with col_g3:
-        if not df_cat.empty:
-            fig_cat = px.bar(df_cat.sort_values('Valor', ascending=True), x='Valor', y='Categoria', orientation='h', title="CATEGORIAS", text_auto='.2f', color_discrete_sequence=['#42D6D6'])
+        if not df_cat.empty and df_cat['Categoria'].notna().any():
+            fig_cat = px.bar(df_cat.dropna(subset=['Categoria']).sort_values('Valor', ascending=True), x='Valor', y='Categoria', orientation='h', title="CATEGORIAS", text_auto='.2f', color_discrete_sequence=['#42D6D6'])
             st.plotly_chart(apply_chart_style(fig_cat), use_container_width=True)
     with col_g4:
-        if not df_dev.empty:
-            fig_dev = px.bar(df_dev.sort_values('Valor', ascending=True), x='Valor', y='Pessoa', orientation='h', title="PESSOAS (DEVEDORES)", text_auto='.2f', color_discrete_sequence=['#42D6D6'])
+        if not df_dev.empty and df_dev['Pessoa'].notna().any():
+            fig_dev = px.bar(df_dev.dropna(subset=['Pessoa']).sort_values('Valor', ascending=True), x='Valor', y='Pessoa', orientation='h', title="PESSOAS (DEVEDORES)", text_auto='.2f', color_discrete_sequence=['#42D6D6'])
             st.plotly_chart(apply_chart_style(fig_dev), use_container_width=True)
 
     st.divider()
     st.markdown("### Resumo de Débitos do Período")
-    conn = sqlite3.connect('cashflow.db')
-    df_resumo = pd.read_sql_query(f"SELECT cartao as Cartão, data as 'Data Vencimento', estabelecimento as Estabelecimento, descricao as Descrição, valor_parcela as Valor, devedor as Pessoa FROM transacoes{filtro_sql} ORDER BY substr(data,7,4) ASC, substr(data,4,2) ASC, substr(data,1,2) ASC", conn, params=params_sql)
-    conn.close()
+    df_resumo = carregar_dados(f"SELECT cartao as \"Cartão\", data as \"Data Vencimento\", estabelecimento as \"Estabelecimento\", descricao as \"Descrição\", valor_parcela as \"Valor\", devedor as \"Pessoa\" FROM transacoes{filtro_sql} ORDER BY substr(data,7,4) ASC, substr(data,4,2) ASC, substr(data,1,2) ASC", params=params_sql)
     
     if not df_resumo.empty:
         df_resumo['Valor'] = df_resumo['Valor'].apply(lambda x: f"R$ {x:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.'))
         st.dataframe(df_resumo, hide_index=True, use_container_width=True)
     else:
         st.info("Nenhum débito encontrado para os filtros selecionados.")
-
 
 
 # ====================================================
@@ -537,7 +548,7 @@ elif menu_selecionado == "Registrar Nova Despesa":
     with col_btn_save:
         if st.button("Salvar Lançamento", type="primary", use_container_width=True):
             if estabelecimento and valor_total > 0:
-                conn = sqlite3.connect('cashflow.db')
+                conn = get_db_connection()
                 c = conn.cursor()
                 
                 if tipo_pgto == "À Vista":
@@ -553,7 +564,7 @@ elif menu_selecionado == "Registrar Nova Despesa":
                 is_cartao = False
 
                 if forma_pgto == "CARTÃO DE CRÉDITO" and cartao:
-                    c.execute("SELECT dia_fechamento, dia_vencimento FROM cartoes WHERE nome = ?", (cartao,))
+                    c.execute("SELECT dia_fechamento, dia_vencimento FROM cartoes WHERE nome = %s", (cartao,))
                     res_cartao = c.fetchone()
                     if res_cartao:
                         dia_fechamento, dia_vencimento = res_cartao
@@ -605,7 +616,7 @@ elif menu_selecionado == "Registrar Nova Despesa":
 
                     c.execute('''INSERT INTO transacoes 
                                  (data, estabelecimento, descricao, tipo_pgto, valor_total, qtd_parc, valor_parcela, forma_pgto, cartao, categoria, devedor) 
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''', 
                               (data_parc.strftime('%d/%m/%Y'), estabelecimento, desc_parc, tipo_pgto, valor_total, qtd_parc, valor_parcela, forma_pgto, cartao, categoria, devedor))
                 
                 conn.commit()
@@ -619,9 +630,7 @@ elif menu_selecionado == "Registrar Nova Despesa":
     st.subheader("Histórico de Lançamentos")
     st.markdown(txt_ajuda_edicao)
     
-    conn = sqlite3.connect('cashflow.db')
-    df_trans = pd.read_sql_query("SELECT * FROM transacoes ORDER BY id DESC", conn)
-    conn.close()
+    df_trans = carregar_dados("SELECT * FROM transacoes ORDER BY id DESC")
     
     df_trans.insert(0, "Excluir", False)
     col_config_trans = {
@@ -657,17 +666,16 @@ elif menu_selecionado == "Gestão de Receitas":
         origem = st.text_input("Recebido de (Origem):")
         if st.form_submit_button("Salvar Receita", type="primary"):
             if origem and valor > 0:
-                conn = sqlite3.connect('cashflow.db')
-                conn.execute('INSERT INTO receitas (data, origem, conta, recebimento, valor) VALUES (?, ?, ?, ?, ?)', (data_rec.strftime('%d/%m/%Y'), origem, conta, recebimento, valor))
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('INSERT INTO receitas (data, origem, conta, recebimento, valor) VALUES (%s, %s, %s, %s, %s)', (data_rec.strftime('%d/%m/%Y'), origem, conta, recebimento, valor))
                 conn.commit()
                 conn.close()
                 st.rerun()
 
     st.divider()
     st.markdown(txt_ajuda_edicao)
-    conn = sqlite3.connect('cashflow.db')
-    df_receitas = pd.read_sql_query("SELECT * FROM receitas ORDER BY id DESC", conn)
-    conn.close()
+    df_receitas = carregar_dados("SELECT * FROM receitas ORDER BY id DESC")
     
     df_receitas.insert(0, "Excluir", False)
     col_config_rec = {
@@ -734,10 +742,10 @@ elif menu_selecionado == "Contas Fixas / Assinaturas":
             
             id_ref = str(uuid.uuid4())
             
-            conn = sqlite3.connect('cashflow.db')
+            conn = get_db_connection()
             c = conn.cursor()
             c.execute('''INSERT INTO contas_fixas (dia, valor, descricao, estabelecimento, forma_pgto, cartao, categoria, devedor, status, id_referencia) 
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Ativa', ?)''', 
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Ativa', %s)''', 
                       (dia, valor, descricao, estabelecimento, forma_pgto, cartao, categoria, devedor, id_ref))
             
             agora = datetime.datetime.now()
@@ -748,7 +756,7 @@ elif menu_selecionado == "Contas Fixas / Assinaturas":
             dia_vencimento = None
             
             if forma_pgto == "CARTÃO DE CRÉDITO" and cartao:
-                c.execute("SELECT dia_fechamento, dia_vencimento FROM cartoes WHERE nome = ?", (cartao,))
+                c.execute("SELECT dia_fechamento, dia_vencimento FROM cartoes WHERE nome = %s", (cartao,))
                 res_cartao = c.fetchone()
                 if res_cartao:
                     dia_fechamento, dia_vencimento = res_cartao
@@ -767,7 +775,7 @@ elif menu_selecionado == "Contas Fixas / Assinaturas":
                             mes_venc_base += 2
                             if mes_venc_base > 12:
                                 mes_venc_base -= 12; ano_venc_base += 1
-                                
+                            
             for i in range(12):
                 mes_venc_i = mes_venc_base + i
                 ano_venc_i = ano_venc_base + (mes_venc_i - 1) // 12
@@ -781,11 +789,11 @@ elif menu_selecionado == "Contas Fixas / Assinaturas":
                     ultimo_dia_i = calendar.monthrange(ano_venc_i, mes_venc_i)[1]
                     dia_venc_real = min(dia, ultimo_dia_i)
                     data_parc = datetime.date(ano_venc_i, mes_venc_i, dia_venc_real)
-                    
+                
                 desc_parc = f"{descricao} (Assinatura)"
                 c.execute('''INSERT INTO transacoes 
                              (data, estabelecimento, descricao, tipo_pgto, valor_total, qtd_parc, valor_parcela, forma_pgto, cartao, categoria, devedor, id_conta_fixa) 
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''', 
                           (data_parc.strftime('%d/%m/%Y'), estabelecimento, desc_parc, "À Vista", valor, 1, valor, forma_pgto, cartao, categoria, devedor, id_ref))
             
             conn.commit()
@@ -795,9 +803,7 @@ elif menu_selecionado == "Contas Fixas / Assinaturas":
 
     st.divider()
     st.markdown(txt_ajuda_edicao)
-    conn = sqlite3.connect('cashflow.db')
-    df_cf = pd.read_sql_query("SELECT * FROM contas_fixas ORDER BY dia ASC", conn)
-    conn.close()
+    df_cf = carregar_dados("SELECT * FROM contas_fixas ORDER BY dia ASC")
     
     df_cf.insert(0, "Excluir", False)
     col_config = {
@@ -816,26 +822,27 @@ elif menu_selecionado == "Contas Fixas / Assinaturas":
             
             import datetime
             hoje = datetime.datetime.now()
-            conn = sqlite3.connect('cashflow.db')
+            conn = get_db_connection()
             c = conn.cursor()
             
             # Deletar lançamentos futuros de assinaturas canceladas
             c.execute("SELECT id_referencia FROM contas_fixas WHERE status='Cancelada'")
             canceladas = [row[0] for row in c.fetchall() if row[0]]
             if canceladas:
-                placeholders = ','.join('?' for _ in canceladas)
-                df_trans_canc = pd.read_sql_query(f"SELECT id, data FROM transacoes WHERE id_conta_fixa IN ({placeholders})", conn, params=canceladas)
+                placeholders = ','.join('%s' for _ in canceladas)
+                c.execute(f"SELECT id, data FROM transacoes WHERE id_conta_fixa IN ({placeholders})", tuple(canceladas))
+                trans_canc = c.fetchall()
                 ids_to_delete = []
-                for _, row in df_trans_canc.iterrows():
+                for row in trans_canc:
                     try:
-                        d = datetime.datetime.strptime(row['data'], '%d/%m/%Y')
+                        d = datetime.datetime.strptime(row[1], '%d/%m/%Y')
                         if d > hoje:
-                            ids_to_delete.append(row['id'])
+                            ids_to_delete.append(row[0])
                     except:
                         pass
                 if ids_to_delete:
-                    p = ','.join('?' for _ in ids_to_delete)
-                    c.execute(f"DELETE FROM transacoes WHERE id IN ({p})", ids_to_delete)
+                    p = ','.join('%s' for _ in ids_to_delete)
+                    c.execute(f"DELETE FROM transacoes WHERE id IN ({p})", tuple(ids_to_delete))
             
             # Atualizar lançamentos futuros das ativas
             c.execute("SELECT id_referencia, dia, valor, descricao, estabelecimento, forma_pgto, cartao, categoria, devedor FROM contas_fixas WHERE status='Ativa'")
@@ -843,14 +850,14 @@ elif menu_selecionado == "Contas Fixas / Assinaturas":
             for ativa in ativas:
                 id_ref, c_dia, c_valor, c_desc, c_estab, c_forma, c_cartao, c_cat, c_dev = ativa
                 if id_ref:
-                    c.execute("SELECT id, data FROM transacoes WHERE id_conta_fixa=?", (id_ref,))
+                    c.execute("SELECT id, data FROM transacoes WHERE id_conta_fixa=%s", (id_ref,))
                     trans_ativas = c.fetchall()
                     for t_id, t_data in trans_ativas:
                         try:
                             d = datetime.datetime.strptime(t_data, '%d/%m/%Y')
                             if d > hoje:
                                 desc_parc = f"{c_desc} (Assinatura)"
-                                c.execute('''UPDATE transacoes SET valor_total=?, valor_parcela=?, descricao=?, estabelecimento=?, forma_pgto=?, cartao=?, categoria=?, devedor=? WHERE id=?''', 
+                                c.execute('''UPDATE transacoes SET valor_total=%s, valor_parcela=%s, descricao=%s, estabelecimento=%s, forma_pgto=%s, cartao=%s, categoria=%s, devedor=%s WHERE id=%s''', 
                                           (c_valor, c_valor, desc_parc, c_estab, c_forma, c_cartao, c_cat, c_dev, t_id))
                         except:
                             pass
@@ -872,17 +879,16 @@ elif menu_selecionado == "Cadastro de Cartões":
         bandeira = st.radio("Bandeira:", ["MasterCard", "Visa"], horizontal=True)
         if st.form_submit_button("Salvar Cartão", type="primary"):
             if nome:
-                conn = sqlite3.connect('cashflow.db')
-                conn.execute('INSERT INTO cartoes (nome, dia_fechamento, dia_vencimento, bandeira) VALUES (?, ?, ?, ?)', (nome.upper(), dia_fechamento, dia_vencimento, bandeira))
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('INSERT INTO cartoes (nome, dia_fechamento, dia_vencimento, bandeira) VALUES (%s, %s, %s, %s)', (nome.upper(), dia_fechamento, dia_vencimento, bandeira))
                 conn.commit()
                 conn.close()
                 st.rerun()
 
     st.divider()
     st.markdown(txt_ajuda_edicao)
-    conn = sqlite3.connect('cashflow.db')
-    df_cartoes = pd.read_sql_query("SELECT * FROM cartoes ORDER BY id ASC", conn)
-    conn.close()
+    df_cartoes = carregar_dados("SELECT * FROM cartoes ORDER BY id ASC")
     df_cartoes.insert(0, "Excluir", False)
     edited_cartoes = st.data_editor(df_cartoes, num_rows="dynamic", hide_index=True, use_container_width=True, column_config={"id": None, "Excluir": st.column_config.CheckboxColumn("Excluir")})
     col_btn1, col_btn2 = st.columns(2)
@@ -900,17 +906,16 @@ elif menu_selecionado == "Gestão de Categorias":
         cor = st.color_picker("Cor:", value="#00C49F")
         if st.form_submit_button("Salvar Categoria", type="primary"):
             if nome:
-                conn = sqlite3.connect('cashflow.db')
-                conn.execute('INSERT INTO categorias (nome, cor) VALUES (?, ?)', (nome.upper(), cor))
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('INSERT INTO categorias (nome, cor) VALUES (%s, %s)', (nome.upper(), cor))
                 conn.commit()
                 conn.close()
                 st.rerun()
 
     st.divider()
     st.markdown(txt_ajuda_edicao)
-    conn = sqlite3.connect('cashflow.db')
-    df_cat = pd.read_sql_query("SELECT * FROM categorias ORDER BY id ASC", conn)
-    conn.close()
+    df_cat = carregar_dados("SELECT * FROM categorias ORDER BY id ASC")
     df_cat.insert(0, "Excluir", False)
     edited_cat = st.data_editor(df_cat, num_rows="dynamic", hide_index=True, use_container_width=True, column_config={"id": None, "Excluir": st.column_config.CheckboxColumn("Excluir")})
     col_btn1, col_btn2 = st.columns(2)
@@ -929,17 +934,16 @@ elif menu_selecionado == "Gestão de Estabelecimentos":
         tipo = st.radio("Tipo:", ["Físico", "Online"], horizontal=True)
         if st.form_submit_button("Salvar Cadastro", type="primary"):
             if nome:
-                conn = sqlite3.connect('cashflow.db')
-                conn.execute('INSERT INTO estabelecimentos (nome, razao_social, tipo) VALUES (?, ?, ?)', (nome.upper(), razao_social.upper(), tipo))
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('INSERT INTO estabelecimentos (nome, razao_social, tipo) VALUES (%s, %s, %s)', (nome.upper(), razao_social.upper(), tipo))
                 conn.commit()
                 conn.close()
                 st.rerun()
 
     st.divider()
     st.markdown(txt_ajuda_edicao)
-    conn = sqlite3.connect('cashflow.db')
-    df_estab = pd.read_sql_query("SELECT * FROM estabelecimentos ORDER BY id ASC", conn)
-    conn.close()
+    df_estab = carregar_dados("SELECT * FROM estabelecimentos ORDER BY id ASC")
     df_estab.insert(0, "Excluir", False)
     edited_estab = st.data_editor(df_estab, num_rows="dynamic", hide_index=True, use_container_width=True, column_config={"id": None, "Excluir": st.column_config.CheckboxColumn("Excluir")})
     col_btn1, col_btn2 = st.columns(2)
@@ -956,17 +960,16 @@ elif menu_selecionado == "Gestão de Devedores":
         nome = st.text_input("Nome do Devedor:")
         if st.form_submit_button("Salvar Devedor", type="primary"):
             if nome:
-                conn = sqlite3.connect('cashflow.db')
-                conn.execute('INSERT INTO devedores (nome) VALUES (?)', (nome.upper(),))
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('INSERT INTO devedores (nome) VALUES (%s)', (nome.upper(),))
                 conn.commit()
                 conn.close()
                 st.rerun()
 
     st.divider()
     st.markdown(txt_ajuda_edicao)
-    conn = sqlite3.connect('cashflow.db')
-    df_dev = pd.read_sql_query("SELECT * FROM devedores ORDER BY id ASC", conn)
-    conn.close()
+    df_dev = carregar_dados("SELECT * FROM devedores ORDER BY id ASC")
     df_dev.insert(0, "Excluir", False)
     edited_dev = st.data_editor(df_dev, num_rows="dynamic", hide_index=True, use_container_width=True, column_config={"id": None, "Excluir": st.column_config.CheckboxColumn("Excluir")})
     col_btn1, col_btn2 = st.columns(2)
